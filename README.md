@@ -4,6 +4,103 @@
 
 # 2. Написать SQL запросы
 
+2.1. Сумма по клиентам (наименование клиента, сумма в валюте)
+````sql
+SELECT
+  c.name AS client_name,
+  COALESCE(SUM(oi.quantity * oi.price), 0) AS total_amount
+FROM clients c
+LEFT JOIN orders o ON o.client_id = c.id
+LEFT JOIN order_items oi ON oi.order_id = o.id
+GROUP BY c.id, c.name
+ORDER BY total_amount DESC;
+````
+
+2.2. Количество дочерних элементов первого уровня для категорий
+````sql
+SELECT
+  c.id,
+  c.name,
+  COUNT(ch.id) AS children_count
+FROM categories c
+LEFT JOIN categories ch ON ch.parent_id = c.id
+GROUP BY c.id, c.name
+ORDER BY children_count DESC;
+````
+
+2.3.1. Топ‑5 самых покупаемых товаров за последний месяц (по количеству штук), с категорией 1-го уровня (root‑категория)
+- используем рекурсивный CTE, чтобы найти корневую категорию (parent_id IS NULL) для каждой категории
+````sql
+CREATE OR REPLACE VIEW top_5_products_last_month AS
+WITH RECURSIVE cat_root AS (
+  SELECT id, name, parent_id, id AS root_id, name AS root_name
+  FROM categories
+  WHERE parent_id IS NULL
+
+  UNION ALL
+
+  SELECT c.id, c.name, c.parent_id, cr.root_id, cr.root_name
+  FROM categories c
+  JOIN cat_root cr ON c.parent_id = cr.id
+)
+SELECT
+  p.id    AS product_id,
+  p.name  AS product_name,
+  cr.root_name AS category_level_1,
+  SUM(oi.quantity) AS total_quantity_sold
+FROM order_items oi
+JOIN orders o ON oi.order_id = o.id
+JOIN products p ON oi.product_id = p.id
+LEFT JOIN (
+  -- для каждой категории выбираем её корневую категорию (если категория NULL — NULL)
+  SELECT id, root_id, root_name FROM (
+    SELECT c.id, cr.root_id, cr.root_name,
+           ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY cr.root_id) rn
+    FROM categories c
+    LEFT JOIN cat_root cr ON c.id = cr.id OR c.parent_id = cr.id
+  ) t WHERE rn = 1
+) cr_map ON p.category_id = cr_map.id
+LEFT JOIN categories cr ON cr.id = cr_map.root_id
+WHERE o.created_at >= now() - INTERVAL '1 month'
+GROUP BY p.id, p.name, cr.root_name
+ORDER BY total_quantity_sold DESC
+LIMIT 5;
+````
+
+2.3.2. Анализ и варианты оптимизации (кратко)
+
+- Индексы (первые шаги)
+  - orders(created_at) — ускорит поиск по периоду
+  - order_items(product_id), order_items(order_id) — ускорят агрегации и JOIN
+  - products(category_id) и categories(parent_id)
+  Примеры:
+  ```sql
+  CREATE INDEX ON orders (created_at);
+  CREATE INDEX ON order_items (product_id);
+  CREATE INDEX ON order_items (order_id);
+  CREATE INDEX ON products (category_id);
+  CREATE INDEX ON categories (parent_id);
+  ```
+
+- Уменьшить число JOIN-ов
+  - Денормализовать: в таблицу products добавить колонку root_category_id (или category_level_1_id) и поддерживать её при изменении категорий. Тогда запрос избегает рекурсивного обхода.
+  - Добавить индекс products(root_category_id).
+
+- Материализованный/инкрементный предрасчёт
+  - Создать материализованный view или отдельную таблицу agg_product_sales(product_id, period_start, total_qty) и обновлять её по расписанию (refresh materialized view) или поддерживать через триггеры/фоновые таски при создании заказов.
+  - Пример materialized view:
+    ```sql
+    CREATE MATERIALIZED VIEW mv_product_monthly_sales AS
+    SELECT p.id AS product_id, date_trunc('month', o.created_at) AS month, SUM(oi.quantity) total_qty
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.id
+    JOIN products p ON oi.product_id = p.id
+    GROUP BY p.id, date_trunc('month', o.created_at);
+    ```
+    Затем для топ‑5 — запрос к mv_product_monthly_sales для текущего месяца с JOIN по products и категориям.
+
+- Партиционирование
+  - Партиционировать таблицы orders и/или order_items по времени.
 
 
 # 3. Сервис «Добавление товара в заказ»
